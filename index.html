@@ -2638,12 +2638,22 @@
   @media(max-width:880px){ .pnav{order:2} }
   .mobgear{display:none}
   @media(max-width:880px){
-    .shell{grid-template-columns:1fr;padding:14px}
-    .rail{position:static}
+    .shell{grid-template-columns:1fr;padding:12px;gap:14px}
+    /* レール（アプリ一覧）が縦に伸びて本文を圧迫しないよう、コンパクトなスクロール領域に */
+    .rail{position:static;max-height:40vh;overflow-y:auto;-webkit-overflow-scrolling:touch;
+      border:1px solid var(--line);border-radius:14px;background:var(--pearl);padding:12px;box-shadow:var(--shadow)}
+    .rail .label{margin-top:10px}
     .bar{flex-wrap:wrap;gap:10px}
     .source{order:3;width:100%;justify-content:center}
     .pathhint{font-size:11px}
-    .bubblewrap{max-width:84%}
+    .bubblewrap{max-width:90%}
+    /* 本文の余白・文字を引き締めて可読性を確保 */
+    .pad{padding:16px 15px}
+    .md h1{font-size:22px} .md h2{font-size:18px} .md h3{font-size:15.5px}
+    .md p,.md li{font-size:15px}
+    .md table{display:block;overflow-x:auto;white-space:nowrap}
+    .tabs button{padding:10px 12px;font-size:13.5px}
+    .turn{margin:14px 0}
   }
 </style>
 </head>
@@ -2921,18 +2931,37 @@ function finalizeModel(model){
 /* =====================================================================
    Drive アダプタ（GIS トークン + Drive REST v3）※ 本番URLで有効
    ===================================================================== */
-let _driveToken = null;
+let _driveToken = null, _driveTokenExp = 0;
+/* アクセストークンを sessionStorage に保持し、リロードや再訪での再認証を不要にする
+   （同一タブのセッション内で有効。トークンは Google の仕様で約1時間で失効） */
+(function restoreDriveToken(){
+  try{ const t=JSON.parse(sessionStorage.getItem("ld:driveToken")||"null");
+    if(t&&t.token&&t.exp>Date.now()+60000){ _driveToken=t.token; _driveTokenExp=t.exp; } }catch(e){}
+})();
+function driveTokenValid(){ return !!_driveToken && _driveTokenExp>Date.now()+60000; }
+function saveDriveToken(token, expiresInSec){
+  _driveToken=token; _driveTokenExp=Date.now()+((Number(expiresInSec)||3600)*1000);
+  try{ sessionStorage.setItem("ld:driveToken", JSON.stringify({token:_driveToken, exp:_driveTokenExp})); }catch(e){}
+}
 function loadScript(src){ return new Promise((res,rej)=>{ if([...document.scripts].some(s=>s.src===src))return res(); const s=document.createElement("script"); s.src=src; s.onload=res; s.onerror=()=>rej(new Error("script load failed: "+src)); document.head.appendChild(s); }); }
-async function driveConnect(){
+async function driveConnect(force){
   if(!CONFIG.googleClientId) throw new Error("NO_CLIENT_ID");
+  if(!force && driveTokenValid()) return;                 // 有効なトークンがあれば再認証しない
   await loadScript("https://accounts.google.com/gsi/client");
+  const consented = !!store.get("driveConsented");
   return new Promise((resolve,reject)=>{
+    let silent=consented, settled=false;
     try{
       const tc = google.accounts.oauth2.initTokenClient({
         client_id: CONFIG.googleClientId, scope: CONFIG.driveScope,
-        callback: (r)=>{ if(r&&r.access_token){_driveToken=r.access_token; resolve();} else reject(new Error("AUTH_FAILED")); },
+        callback: (r)=>{ if(settled)return; if(r&&r.access_token){ settled=true; saveDriveToken(r.access_token, r.expires_in); store.set("driveConsented",true); resolve(); } else { settled=true; reject(new Error("AUTH_FAILED")); } },
+        error_callback: (err)=>{
+          // サイレント取得に失敗した場合のみ、同意画面を出して1度だけ再試行
+          if(silent && !settled){ silent=false; try{ tc.requestAccessToken({prompt:"consent"}); return; }catch(e){} }
+          if(!settled){ settled=true; reject(new Error("AUTH_FAILED")); }
+        },
       });
-      tc.requestAccessToken({prompt: _driveToken?"":"consent"});
+      tc.requestAccessToken({prompt: silent?"":"consent"});
     }catch(e){ reject(e); }
   });
 }
@@ -2948,6 +2977,10 @@ async function driveList(q){
   return files;
 }
 async function driveText(id){ return await (await driveApi("files/"+id+"?alt=media")).text(); }
+/* Drive から構築したモデルを localStorage にキャッシュし、再訪時は即時表示（認証・再取得不要） */
+function saveDriveCache(model){ store.set("driveModelCache", {at:Date.now(), root:CONFIG.driveRootName, model}); }
+function loadDriveCache(){ const o=store.get("driveModelCache"); return (o&&o.model&&o.root===CONFIG.driveRootName)?o:null; }
+function clearDriveCache(){ store.set("driveModelCache", null); }
 const FOLDER="mimeType='application/vnd.google-apps.folder'";
 async function driveBuildModel(){
   const roots=await driveList(`name='${CONFIG.driveRootName}' and ${FOLDER} and trashed=false`);
@@ -3046,12 +3079,32 @@ async function localBuildModel(){
   }
   return finalizeModel({apps, global});
 }
+/* macOS 対策：ホームフォルダはブラウザ選択がブロックされるため、グローバル情報の
+   「.claude」フォルダ（または .claude / learning-logs を含むフォルダ）を別途選んで読み込む */
+async function pickLocalGlobal(){
+  if(!fsSupported()){ alert("この機能はデスクトップ版 Chrome / Edge でのみ利用できます。"); return; }
+  try{
+    const h=await window.showDirectoryPicker();
+    let ll=await getSub(h,"learning-logs");                       // learning-logs を直接選んだ
+    if(!ll){ const dc=await getSub(h,".claude"); if(dc) ll=await getSub(dc,"learning-logs"); } // .claude を含むフォルダ
+    if(!ll && (h.name===".claude")) ll=await getSub(h,"learning-logs");                         // .claude 自体を選んだ
+    if(!ll){ alert("learning-logs が見つかりませんでした。「.claude」フォルダ（または .claude / learning-logs を含むフォルダ）を選んでください。"); return; }
+    const g=state.model.global||(state.model.global={skillsMatrix:null,glossary:"",reports:[]});
+    g._localHint=false;
+    try{ const sm=await getFileText(ll,"skills-matrix.json"); if(sm) g.skillsMatrix=JSON.parse(sm); }catch(e){}
+    g.glossary=await getFileText(ll,"glossary.md");
+    const rep=await getSub(ll,"reports");
+    if(rep){ const m=await readDirMd(rep); m.sort((a,b)=>b.name.localeCompare(a.name)); g.reports=m.map(x=>({name:x.name, md:x.text})); }
+    render();
+  }catch(e){ if(e&&e.name==="AbortError") return; alert("読み込めませんでした: "+(e&&e.message||e)); }
+}
 
 /* =====================================================================
    状態 & レンダリング
    ===================================================================== */
 const state = { mode:"sample", model:null, view:"app", appId:null, tab:"sessions", docId:null, openSession:null, search:"", sort: store.get("sort")||"recent", pinOnly:false,
-  section:"docs", gtab:"use", gsearch:"", notePreview:false, memoOpen:false, group: store.get("group")||false };
+  section:"docs", gtab:"use", gsearch:"", notePreview:false, memoOpen:false, group: store.get("group")||false,
+  ready:false, _fromCache:false, _driveCacheAt:0 };
 const pins = new Set(store.get("pins")||[]);
 const esc = (s)=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 /* Markdown 描画は DOMPurify でサニタイズ（未ロード時は生描画にフォールバック） */
@@ -3087,7 +3140,7 @@ function renderCtrls(){
       <label class="pinflt"><input type="checkbox" ${state.pinOnly?"checked":""} onchange="setPinOnly(this.checked)">★のみ</label>
     </div>
     <label class="pinflt"><input type="checkbox" ${state.group?"checked":""} onchange="setGroup(this.checked)">フェーズで分類</label>`;
-  const s=document.getElementById("appSearch"); if(s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
+  // 自動フォーカスはしない（特にスマホでページ遷移のたびにキーボードが開くのを防ぐ）
 }
 function onSearch(v){ state.search=v; renderApplist(); }
 function setSort(v){ state.sort=v; store.set("sort",v); renderApplist(); }
@@ -3128,8 +3181,13 @@ function selectTab(t){ state.tab=t; state.openSession=null; render(); }
 
 function renderNotice(){
   const n=document.getElementById("notice");
-  if(state.mode==="local" && !store.get("localNoticeDismissed")){
-    n.innerHTML=`<div class="notice">⚠️ <div><b>ローカル参照モード</b>：このPCのデスクトップ版 Chrome / Edge でのみ動作します。スマホ・別PCからは「☁️ Drive」をご利用ください。グローバル情報も読むには、<b><code>.claude</code> と <code>claude-workspace</code> を含むフォルダ（ホーム）</b>を選んでください。</div><button class="notice-x" title="閉じる（この端末では今後表示しません）" onclick="dismissNotice()">×</button></div>`;
+  // ローカル参照：フォルダ選択前の案内のみ表示。読み込み完了後（state.ready）は自動的に非表示にする
+  if(state.mode==="local" && !state.ready && !store.get("localNoticeDismissed")){
+    n.innerHTML=`<div class="notice">⚠️ <div><b>ローカル参照モード</b>：このPCのデスクトップ版 Chrome / Edge でのみ動作します。スマホ・別PCからは「☁️ Drive」をご利用ください。グローバル情報も読むには、<b><code>.claude</code> と <code>claude-workspace</code> を含むフォルダ</b>を選んでください（macOSでホームが選べない場合は読み込み後に「グローバル情報」から別途指定できます）。</div><button class="notice-x" title="閉じる（この端末では今後表示しません）" onclick="dismissNotice()">×</button></div>`;
+  } else if(state.mode==="drive" && state._fromCache){
+    const t=state._driveCacheAt?new Date(state._driveCacheAt):null;
+    const ts=t?`${t.getMonth()+1}/${t.getDate()} ${String(t.getHours()).padStart(2,"0")}:${String(t.getMinutes()).padStart(2,"0")}`:"";
+    n.innerHTML=`<div class="notice" style="background:var(--blue-tint);border-color:rgba(32,144,232,.3)">💾 <div>保存済みデータを表示中${ts?`（取得: ${ts}）`:""}。認証なしで素早く表示しています。最新化するには更新してください。</div><button class="notice-x" style="font-size:13px;font-weight:600;opacity:1" title="Driveから再取得" onclick="refreshDrive()">🔄 更新</button></div>`;
   } else n.innerHTML="";
 }
 function dismissNotice(){ store.set("localNoticeDismissed", true); renderNotice(); }
@@ -3204,8 +3262,16 @@ function renderSessionDetail(md){
 
 function renderGlobal(){
   const c=document.getElementById("content"); const g=state.model?.global||{};
+  // ローカルでグローバル情報が未読込のとき、.claude を別途選択する案内（macOS 対策）
+  const bar=(state.mode==="local" && g._localHint)
+    ? `<div class="card pad" style="margin-bottom:14px;background:var(--blue-tint);border-color:rgba(32,144,232,.3)">
+         <b>グローバル情報（<code>.claude/learning-logs</code>）が未読込です。</b><br>
+         <span style="font-size:13px;color:var(--mist)">macOS では <code>.claude</code> がホーム直下にあり、ブラウザがホームフォルダの選択をブロックするため自動取得できません。下のボタンで <code>.claude</code> フォルダ（または <code>.claude</code> を含むフォルダ）を直接選択してください。</span><br>
+         <button class="btn" style="margin-top:10px" onclick="pickLocalGlobal()">📂 .claude フォルダを選択</button>
+       </div>` : "";
+  const withBar=(html)=>bar+html;
   if(state.tab==="g_skills"){
-    if(!g.skillsMatrix){ c.innerHTML=`<div class="card empty">スキルマトリクスが見つかりません。${state.mode==="local"?"（ローカルではグローバルは <code>~/.claude</code> 配下。Driveモードで参照できます）":""}</div>`; return; }
+    if(!g.skillsMatrix){ c.innerHTML=withBar(`<div class="card empty">スキルマトリクスが見つかりません。${state.mode==="local"?"（ローカルではグローバルは <code>.claude/learning-logs</code> 配下。上のボタンで選択するか、Driveモードで参照できます）":""}</div>`); return; }
     let html;
     const sm=g.skillsMatrix;
     if(sm && typeof sm==="object" && !Array.isArray(sm) && Object.values(sm).every(v=>v&&typeof v==="object")){
@@ -3213,16 +3279,16 @@ function renderGlobal(){
       html=`<table><thead><tr><th>スキル</th>${cols.map(k=>`<th>${esc(k)}</th>`).join("")}</tr></thead><tbody>`+
         Object.entries(sm).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>${cols.map(col=>`<td>${esc(v[col])}</td>`).join("")}</tr>`).join("")+`</tbody></table>`;
     } else { html=`<pre><code>${esc(JSON.stringify(sm,null,2))}</code></pre>`; }
-    c.innerHTML=`<div class="card pad md"><h2>スキルの成長</h2>${html}</div>`; return;
+    c.innerHTML=withBar(`<div class="card pad md"><h2>スキルの成長</h2>${html}</div>`); return;
   }
-  if(state.tab==="g_glossary"){ c.innerHTML=`<div class="card pad md">${g.glossary?mdParse(g.glossary):'<p class="empty">用語集がありません。</p>'}</div>`; return; }
+  if(state.tab==="g_glossary"){ c.innerHTML=withBar(`<div class="card pad md">${g.glossary?mdParse(g.glossary):'<p class="empty">用語集がありません。</p>'}</div>`); return; }
   if(state.tab==="g_reports"){
     const reps=g.reports||[];
-    if(!reps.length){ c.innerHTML=`<div class="card empty">週次レポートがありません。</div>`; return; }
+    if(!reps.length){ c.innerHTML=withBar(`<div class="card empty">週次レポートがありません。</div>`); return; }
     if(state.docId==null||!reps.find(r=>r.name===state.docId)) state.docId=reps[0].name;
     const sub=reps.map(r=>`<button class="${r.name===state.docId?'active':''}" onclick="selectDoc('${esc(r.name)}')">${esc(r.name.replace(/\.md$/,''))}</button>`).join("");
     const rep=reps.find(r=>r.name===state.docId)||reps[0];
-    c.innerHTML=`<div class="subnav">${sub}</div><div class="card pad md">${mdParse(rep.md||"")}</div>`; return;
+    c.innerHTML=withBar(`<div class="subnav">${sub}</div><div class="card pad md">${mdParse(rep.md||"")}</div>`); return;
   }
 }
 
@@ -3235,13 +3301,16 @@ function showSetup(title,body,btnLabel,btnFn){
 }
 
 async function setSourceMode(mode){
-  state.mode=mode; state.view="app"; state.appId=null; state.openSession=null; setSrcButtons(); renderNotice(); renderPathHint();
+  state.mode=mode; state.view="app"; state.appId=null; state.openSession=null; state.ready=false; state._fromCache=false; setSrcButtons(); renderNotice(); renderPathHint();
   if(mode==="sample"){ state.model=finalizeModel(JSON.parse(JSON.stringify(SAMPLE_MODEL))); afterModelLoaded(); return; }
   if(mode==="drive"){
     if(!CONFIG.googleClientId){ document.getElementById("ctrls").innerHTML=""; document.getElementById("applist").innerHTML=""; document.getElementById("tabs").innerHTML="";
       showSetup("Google Drive 連携の設定が必要です","本番URL（GitHub Pages）に配置し、<code>CONFIG.googleClientId</code> に OAuth クライアントID を設定すると有効になります。詳しくは同梱の README を参照。このチャットのプレビュー枠では動作しません。","サンプルを見る",()=>setSourceMode("sample")); return; }
+    // キャッシュがあれば認証・通信なしで即時表示（「🔄 更新」で最新化できる）
+    const cached=loadDriveCache();
+    if(cached){ state.model=finalizeModel(cached.model); state._fromCache=true; state._driveCacheAt=cached.at; afterModelLoaded(); return; }
     showLoading("Google Drive に接続中…");
-    try{ await driveConnect(); showLoading("Drive からドキュメントを読み込み中…"); state.model=await driveBuildModel(); afterModelLoaded(); }
+    try{ await driveConnect(); showLoading("Drive からドキュメントを読み込み中…"); state.model=await driveBuildModel(); state._fromCache=false; state._driveCacheAt=Date.now(); saveDriveCache(state.model); afterModelLoaded(); }
     catch(e){ const map={NO_CLIENT_ID:"クライアントIDが未設定です。",ROOT_NOT_FOUND:`Drive に「${CONFIG.driveRootName}」フォルダが見つかりません。`,AUTH_FAILED:"認証に失敗しました。"};
       showSetup("Driveに接続できませんでした", (map[e.message]||esc(e.message))+" 本番URLでの実行・権限付与をご確認ください。","サンプルを見る",()=>setSourceMode("sample")); }
     return;
@@ -3250,14 +3319,22 @@ async function setSourceMode(mode){
     if(!fsSupported()){ document.getElementById("ctrls").innerHTML=""; document.getElementById("applist").innerHTML=""; document.getElementById("tabs").innerHTML="";
       renderNotice(); showSetup("このブラウザではローカル参照を使えません","ローカルフォルダ参照はデスクトップ版 Chrome / Edge 等でのみ動作します。スマホ・別PCからは「☁️ Drive」をご利用ください。","サンプルを見る",()=>setSourceMode("sample")); return; }
     renderNotice();
-    showSetup("ローカルの workspace フォルダを選択","「フォルダを選択」を押し、<code>~/claude-workspace</code>（各アプリのフォルダを含む親）を指定してください。読み取りのみです。","フォルダを選択", async()=>{
+    showSetup("ローカルの workspace フォルダを選択","「フォルダを選択」を押し、<code>claude-workspace</code>（各アプリのフォルダを含む親）を指定してください。読み取りのみです。<br><span style=\"font-size:12.5px;color:var(--mist)\">※ macOS では <code>.claude</code> がホーム直下にあり、ブラウザはホームフォルダの選択をブロックします。その場合はアプリ用に <code>claude-workspace</code> を選び、グローバル情報（<code>.claude</code>）は読み込み後に「🌐 グローバル情報」画面から別途指定してください。</span>","フォルダを選択", async()=>{
       try{ showLoading("ローカルフォルダを読み込み中…"); state.model=await localBuildModel(); afterModelLoaded(); }
       catch(e){ if(e&&e.name==="AbortError"){ setSourceMode("local"); return; } showSetup("読み込めませんでした", esc(e.message||"不明なエラー"),"もう一度",()=>setSourceMode("local")); }
     });
     return;
   }
 }
+// Drive を再取得してキャッシュを更新
+async function refreshDrive(){
+  showLoading("Drive を再取得中…");
+  try{ await driveConnect(); showLoading("Drive からドキュメントを読み込み中…"); state.model=await driveBuildModel(); state._fromCache=false; state._driveCacheAt=Date.now(); saveDriveCache(state.model); afterModelLoaded(); }
+  catch(e){ const map={NO_CLIENT_ID:"クライアントIDが未設定です。",ROOT_NOT_FOUND:`Drive に「${CONFIG.driveRootName}」フォルダが見つかりません。`,AUTH_FAILED:"認証に失敗しました。"};
+    showSetup("Driveを再取得できませんでした",(map[e.message]||esc(e.message)),"サンプルを見る",()=>setSourceMode("sample")); }
+}
 function afterModelLoaded(){
+  state.ready=true;
   const apps=state.model?.apps||[];
   state.appId = apps.length? sortedApps()[0].id : null;
   state.view = apps.length? "app" : "global";
@@ -3270,7 +3347,8 @@ function openSettings(){ document.getElementById("overlay").classList.add("show"
 function closeSettings(){ document.getElementById("overlay").classList.remove("show"); }
 function renderSettings(){
   const def=store.get("defaultSource")||"sample"; const fs=store.get("fontSize")||"standard";
-  const driveState = _driveToken?"接続済み":(CONFIG.googleClientId?"未接続":"未設定（クライアントID必要）");
+  const driveState = driveTokenValid()?"接続済み":(CONFIG.googleClientId?"未接続":"未設定（クライアントID必要）");
+  const dcache=loadDriveCache();
   const apps=state.model?.apps||[];
   document.getElementById("settingsPanel").innerHTML=`
     <div class="ph"><h2>⚙️ 設定</h2><button class="closebtn" onclick="closeSettings()">×</button></div>
@@ -3278,6 +3356,7 @@ function renderSettings(){
       <div class="sgroup"><div class="st">接続</div>
         <div class="srow"><span>☁️ Google Drive</span><span class="conn"><b>${esc(driveState)}</b></span></div>
         <div class="srow"><span>📁 ローカル参照</span><span class="conn">${fsSupported()?"このブラウザで利用可":"<b>非対応（デスクトップChrome/Edge）</b>"}</span></div>
+        <div class="srow"><span>💾 Drive キャッシュ</span><span class="conn">${dcache?`保存済み <button class="pchip" style="margin-left:8px" onclick="clearDriveCache();renderSettings()">破棄</button>`:"なし"}</span></div>
       </div>
       <div class="sgroup"><div class="st">既定で開くソース</div>
         <div class="radios">
@@ -3386,10 +3465,12 @@ function renderMemo(c){
 /* ---------- ガイド & コマンド / 自分用メモ ---------- */
 function setSection(sec){ state.section=sec; render(); }
 function setGTab(t){ state.gtab=t; state.gsearch=""; render(); }
-function onGSearch(v){ state.gsearch=v; renderGuide(); }
+let _gsearchFocus=false;
+function onGSearch(v){ state.gsearch=v; _gsearchFocus=true; renderGuide(); }
 function jumpGuide(i){ const el=document.getElementById("gsec-"+i); if(el) el.scrollIntoView({behavior:"smooth",block:"start"}); }
 function toggleNotePv(){ state.notePreview=!state.notePreview; renderGuide(); }
-function restoreGSearchFocus(){ const s=document.querySelector(".gsearch"); if(s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); } }
+// 検索入力による再描画の直後のみカーソルを復帰（ページ遷移時に勝手にフォーカスしてキーボードを開かない）
+function restoreGSearchFocus(){ if(!_gsearchFocus)return; _gsearchFocus=false; const s=document.querySelector(".gsearch"); if(s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); } }
 
 function applySection(){
   const guide = state.section==="guide";
